@@ -176,7 +176,7 @@ RSpec.describe Langfuse::OtelAttributes do
         "langfuse.release" => "v1.0.0",
         "langfuse.trace.input" => '{"query":"test"}',
         "langfuse.trace.output" => '{"result":"success"}',
-        "langfuse.trace.tags" => '["checkout","payment"]',
+        "langfuse.trace.tags" => %w[checkout payment],
         "langfuse.trace.public" => false,
         "langfuse.environment" => "production"
       )
@@ -226,6 +226,27 @@ RSpec.describe Langfuse::OtelAttributes do
       # Test with nil input
       result_nil = described_class.create_trace_attributes(nil)
       expect(result_nil).to eq({})
+    end
+
+    it "omits tags key when tags are nil" do
+      attrs = Langfuse::Types::TraceAttributes.new(tags: nil)
+      result = described_class.create_trace_attributes(attrs)
+
+      expect(result).not_to have_key("langfuse.trace.tags")
+    end
+
+    it "omits tags key when tags are empty" do
+      attrs = Langfuse::Types::TraceAttributes.new(tags: [])
+      result = described_class.create_trace_attributes(attrs)
+
+      expect(result).not_to have_key("langfuse.trace.tags")
+    end
+
+    it "filters non-string elements from tags" do
+      attrs = { tags: ["valid", 123, nil, "also_valid"] }
+      result = described_class.create_trace_attributes(attrs)
+
+      expect(result["langfuse.trace.tags"]).to eq(%w[valid also_valid])
     end
   end
 

@@ -59,6 +59,9 @@ module Langfuse
     RELEASE = "langfuse.release"
     ENVIRONMENT = "langfuse.environment"
 
+    # Validation limits
+    MAX_TAG_LENGTH = 200
+
     # Creates OpenTelemetry attributes from Langfuse trace attributes
     #
     # Converts user-friendly trace attributes into the internal OpenTelemetry
@@ -155,15 +158,24 @@ module Langfuse
       end
     end
 
-    # Filters tags to String-only elements, returns nil if empty or nil
+    # Filters tags to String-only elements within 200-char limit, returns nil if empty or nil
     #
-    # @param tags [Array, nil] Raw tags array
+    # @param tags [Array, nil] Raw tags array (each tag must be ≤200 characters; oversized tags are dropped with a warning)
     # @return [Array<String>, nil] Filtered tags or nil
     # @api private
     def self.normalize_tags(tags)
       return nil if tags.nil?
 
-      filtered = tags.select { |t| t.is_a?(String) }
+      logger = Langfuse.configuration.logger
+      filtered = tags.select do |t|
+        next false unless t.is_a?(String)
+
+        if t.length > MAX_TAG_LENGTH
+          logger.warn("Langfuse: Tag exceeds #{MAX_TAG_LENGTH} characters (#{t.length} chars). Dropping.")
+          next false
+        end
+        true
+      end
       filtered.empty? ? nil : filtered
     end
 

@@ -293,6 +293,35 @@ module Langfuse
     end
   end
 
+  # Shared setters for observation types that interact with a model (Generation, Embedding).
+  # @api private
+  module ModelSetters
+    # @param value [Hash] Usage hash with token counts
+    # @return [void]
+    # @deprecated Use #usage_details= instead.
+    def usage=(value)
+      self.usage_details = value
+    end
+
+    # @param value [Hash] Usage details hash (preserves key shape as provided)
+    # @return [void]
+    def usage_details=(value)
+      update_observation_attributes(usage_details: value)
+    end
+
+    # @param value [String] Model name (e.g., "gpt-4", "claude-3-opus")
+    # @return [void]
+    def model=(value)
+      update_observation_attributes(model: value)
+    end
+
+    # @param value [Hash] Model parameters (temperature, max_tokens, etc.)
+    # @return [void]
+    def model_parameters=(value)
+      update_observation_attributes(model_parameters: value)
+    end
+  end
+
   # Observation for LLM calls. Provides methods to set output, usage, and other LLM-specific metadata.
   #
   # @example Block-based API
@@ -301,7 +330,7 @@ module Langfuse
   #     gen.input = [{ role: "user", content: "Hello" }]
   #     response = call_llm(gen.input)
   #     gen.output = response
-  #     gen.usage = { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
+  #     gen.usage_details = { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
   #   end
   #
   # @example Stateful API
@@ -317,6 +346,8 @@ module Langfuse
   #   gen.end
   #
   class Generation < BaseObservation
+    include ModelSetters
+
     # @param otel_span [OpenTelemetry::SDK::Trace::Span] The underlying OTel span
     # @param otel_tracer [OpenTelemetry::SDK::Trace::Tracer] The OTel tracer
     # @param attributes [Hash, Types::GenerationAttributes, nil] Optional initial attributes
@@ -331,45 +362,10 @@ module Langfuse
       self
     end
 
-    # @param value [Hash] Usage hash with token counts (:prompt_tokens, :completion_tokens, :total_tokens)
+    # @param value [Hash] Cost details hash (prefer :input, :output, :total for aggregate Langfuse cost metrics)
     # @return [void]
-    def usage=(value)
-      return unless @otel_span.recording?
-
-      # Convert to Langfuse API format (camelCase keys)
-      usage_hash = {
-        promptTokens: value[:prompt_tokens] || value["prompt_tokens"],
-        completionTokens: value[:completion_tokens] || value["completion_tokens"],
-        totalTokens: value[:total_tokens] || value["total_tokens"]
-      }.compact
-
-      usage_json = usage_hash.to_json
-      @otel_span.set_attribute("langfuse.observation.usage", usage_json)
-    end
-
-    # @param value [String] Model name (e.g., "gpt-4", "claude-3-opus")
-    # @return [void]
-    def model=(value)
-      return unless @otel_span.recording?
-
-      @otel_span.set_attribute("langfuse.observation.model", value.to_s)
-    end
-
-    # @param value [Hash] Model parameters (temperature, max_tokens, etc.)
-    # @return [void]
-    def model_parameters=(value)
-      return unless @otel_span.recording?
-
-      # Convert to Langfuse API format (camelCase keys)
-      params_hash = {}
-      value.each do |k, v|
-        key_str = k.to_s
-        # Convert snake_case to camelCase
-        camel_key = key_str.gsub(/_([a-z])/) { Regexp.last_match(1).upcase }
-        params_hash[camel_key] = v
-      end
-      params_json = params_hash.to_json
-      @otel_span.set_attribute("langfuse.observation.modelParameters", params_json)
+    def cost_details=(value)
+      update_observation_attributes(cost_details: value)
     end
   end
 
@@ -632,7 +628,7 @@ module Langfuse
   #     vectors = embedding_service.generate(embedding.input, model: embedding.model)
   #     embedding.update(
   #       output: vectors,
-  #       usage: { prompt_tokens: 20, total_tokens: 20 }
+  #       usage_details: { prompt_tokens: 20, total_tokens: 20 }
   #     )
   #   end
   #
@@ -649,6 +645,8 @@ module Langfuse
   #   embedding.end
   #
   class Embedding < BaseObservation
+    include ModelSetters
+
     # @param otel_span [OpenTelemetry::SDK::Trace::Span] The underlying OTel span
     # @param otel_tracer [OpenTelemetry::SDK::Trace::Tracer] The OTel tracer
     # @param attributes [Hash, Types::EmbeddingAttributes, nil] Optional initial attributes
@@ -661,24 +659,6 @@ module Langfuse
     def update(attrs)
       update_observation_attributes(attrs)
       self
-    end
-
-    # @param value [Hash] Usage hash with token counts (:prompt_tokens, :total_tokens)
-    # @return [void]
-    def usage=(value)
-      update_observation_attributes(usage_details: value)
-    end
-
-    # @param value [String] Model name (e.g., "text-embedding-ada-002")
-    # @return [void]
-    def model=(value)
-      update_observation_attributes(model: value)
-    end
-
-    # @param value [Hash] Model parameters (temperature, max_tokens, etc.)
-    # @return [void]
-    def model_parameters=(value)
-      update_observation_attributes(model_parameters: value)
     end
   end
 end

@@ -493,8 +493,15 @@ Available on observations with `as_type: :generation`:
 ```ruby
 obs.model = "gpt-4"
 obs.model_parameters = { temperature: 0.7, max_tokens: 100 }
-obs.usage = { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
+obs.usage_details = { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
+obs.cost_details = { input: 0.02, output: 0.03, total: 0.05 }
 ```
+
+`obs.usage = {...}` is still accepted for compatibility, but it is deprecated and forwards to `usage_details`.
+
+`usage_details` accepts either canonical Langfuse keys (`input`, `output`, `total`) or OpenAI-style keys
+(`prompt_tokens`, `completion_tokens`, `total_tokens`). For `cost_details`, prefer canonical Langfuse keys
+(`input`, `output`, `total`) if you want Langfuse aggregate cost metrics to populate reliably.
 
 Or via `update`:
 
@@ -502,9 +509,9 @@ Or via `update`:
 # Using setters (preferred)
 obs.model = "gpt-4"
 obs.model_parameters = { temperature: 0.7 }
-obs.usage = { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
+obs.usage_details = { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 }
 obs.completion_start_time = Time.now
-obs.cost_details = { total_cost: 0.05 }
+obs.cost_details = { input: 0.02, output: 0.03, total: 0.05 }
 obs.prompt = { name: "greeting", version: 1, is_fallback: false }
 
 # Or using update() with usage_details keyword
@@ -513,7 +520,7 @@ obs.update(
   model_parameters: { temperature: 0.7 },
   usage_details: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
   completion_start_time: Time.now,
-  cost_details: { total_cost: 0.05 },
+  cost_details: { input: 0.02, output: 0.03, total: 0.05 },
   prompt: { name: "greeting", version: 1, is_fallback: false }
 )
 ```
@@ -1011,7 +1018,7 @@ Types::GenerationAttributes.new(
   model: "gpt-4",
   model_parameters: { temperature: 0.7 },
   usage_details: { prompt_tokens: 100, completion_tokens: 50 },
-  cost_details: { total_cost: 0.05 },
+  cost_details: { input: 0.02, output: 0.03, total: 0.05 },
   prompt: { name: "greeting", version: 1, is_fallback: false }
 )
 ```

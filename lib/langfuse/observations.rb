@@ -133,8 +133,7 @@ module Langfuse
     # @yield [observation] Optional block that receives the observation object
     # @return [BaseObservation, Object] The child observation (or block return value if block given)
     def start_observation(name, attrs = {}, as_type: :span, &block)
-      # Call module-level factory with parent context
-      # Skip validation to allow unknown types to fall back to Span
+      # Skip validation so unknown types fall back to Span in the factory.
       child = Langfuse.start_observation(
         name,
         attrs,
@@ -142,24 +141,9 @@ module Langfuse
         parent_span_context: @otel_span.context,
         skip_validation: true
       )
+      return child unless block
 
-      if block
-        # Block-based API: auto-ends when block completes
-        # Set context and execute block
-        current_context = OpenTelemetry::Context.current
-        result = OpenTelemetry::Context.with_current(
-          OpenTelemetry::Trace.context_with_span(child.otel_span, parent_context: current_context)
-        ) do
-          block.call(child)
-        end
-        # Only end if not already ended (events auto-end in start_observation)
-        child.end unless as_type.to_s == OBSERVATION_TYPES[:event]
-        result
-      else
-        # Stateful API - return observation
-        # Events already auto-ended in start_observation
-        child
-      end
+      child.send(:run_in_context, &block)
     end
 
     # Sets observation-level input attributes.
@@ -260,6 +244,27 @@ module Langfuse
       else
         prompt
       end
+    end
+
+    private
+
+    # Runs the block with this observation as the active OTel span,
+    # then ends the span in ensure (events excluded — they auto-end).
+    # @api private
+    def run_in_context
+      parent_ctx = OpenTelemetry::Context.current
+      span_ctx = OpenTelemetry::Trace.context_with_span(@otel_span, parent_context: parent_ctx)
+      OpenTelemetry::Context.with_current(span_ctx) { yield self }
+    ensure
+      safe_end
+    end
+
+    # Ends the span, swallowing errors so ensure never masks a block exception.
+    # @api private
+    def safe_end
+      self.end unless @type == OBSERVATION_TYPES[:event]
+    rescue StandardError
+      nil
     end
   end
 

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-14
+
+### Added
+- Custom/deterministic trace ID support (#74)
+
+### Fixed
+- Bump faraday, json, and addressable to patch CVEs (#75)
+
+### Documentation
+- Align docs with implementation (#70, #76)
+
 ## [0.6.0] - 2026-03-06
 
 ### Added
@@ -77,7 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migrated from legacy ingestion API to OTLP endpoint
 - Removed `tracing_enabled` configuration flag (#2)
 
-[Unreleased]: https://github.com/simplepractice/langfuse-rb/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/simplepractice/langfuse-rb/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/simplepractice/langfuse-rb/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/simplepractice/langfuse-rb/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/simplepractice/langfuse-rb/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/simplepractice/langfuse-rb/compare/v0.3.0...v0.4.0

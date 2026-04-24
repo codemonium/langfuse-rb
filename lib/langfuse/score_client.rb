@@ -31,6 +31,8 @@ module Langfuse
     # @return [Logger] Logger instance
     attr_reader :logger
 
+    HEX_TRACE_ID_PATTERN = /\A[0-9a-f]{32}\z/
+
     # Initialize a new ScoreClient
     #
     # @param api_client [ApiClient] The API client for sending batches
@@ -43,6 +45,9 @@ module Langfuse
       @mutex = Mutex.new
       @flush_thread = nil
       @shutdown = false
+      # Match the immutable tracing setup contract: once this client exists, later config
+      # mutations must not change score sampling without rebuilding the client.
+      @score_sampler = Sampling.build_sampler(config.sample_rate)
 
       start_flush_timer
     end
@@ -76,28 +81,19 @@ module Langfuse
     def create(name:, value:, id: nil, trace_id: nil, session_id: nil, observation_id: nil, comment: nil,
                metadata: nil, environment: nil, data_type: :numeric, dataset_run_id: nil, config_id: nil)
       validate_name(name)
-      # Keep identifier policy server-side to preserve cross-SDK parity and avoid blocking valid future payloads.
       normalized_value = normalize_value(value, data_type)
       data_type_str = Types::SCORE_DATA_TYPES[data_type] || raise(ArgumentError, "Invalid data_type: #{data_type}")
 
+      return unless enqueue_trace_linked_score?(trace_id)
+
       event = build_score_event(
-        name: name,
-        value: normalized_value,
-        id: id,
-        trace_id: trace_id,
-        session_id: session_id,
-        observation_id: observation_id,
-        comment: comment,
-        metadata: metadata,
-        environment: environment,
-        data_type: data_type_str,
-        dataset_run_id: dataset_run_id,
-        config_id: config_id
+        name: name, value: normalized_value, id: id, trace_id: trace_id,
+        session_id: session_id, observation_id: observation_id, comment: comment,
+        metadata: metadata, environment: environment, data_type: data_type_str,
+        dataset_run_id: dataset_run_id, config_id: config_id
       )
 
       @queue << event
-
-      # Trigger flush if batch size reached
       flush if @queue.size >= config.batch_size
     rescue StandardError => e
       logger.error("Langfuse score creation failed: #{e.message}")
@@ -294,13 +290,42 @@ module Langfuse
     # @return [Hash] Hash with :trace_id and :observation_id (may be nil)
     def extract_ids_from_active_span
       span = OpenTelemetry::Trace.current_span
-      return { trace_id: nil, observation_id: nil } unless span&.recording?
+      span_context = span&.context
+      return { trace_id: nil, observation_id: nil } unless span_context&.valid?
 
       {
-        trace_id: span.context.trace_id.unpack1("H*"),
-        observation_id: span.context.span_id.unpack1("H*")
+        trace_id: span_context.trace_id.unpack1("H*"),
+        observation_id: span_context.span_id.unpack1("H*")
       }
     end
+
+    # Score sampling is decided purely by the configured sampler on the trace_id hash,
+    # matching langfuse-python. Non-hex trace ids and session/dataset-only scores bypass sampling.
+    def enqueue_trace_linked_score?(trace_id)
+      return true if trace_id.nil?
+      return true unless HEX_TRACE_ID_PATTERN.match?(trace_id)
+
+      sampler = score_sampler
+      return true if sampler.nil?
+      return true unless sampler.respond_to?(:should_sample?)
+
+      sample_result = sampler.should_sample?(
+        trace_id: [trace_id].pack("H*"),
+        parent_context: nil,
+        links: [],
+        name: "score",
+        kind: OpenTelemetry::Trace::SpanKind::INTERNAL,
+        attributes: {}
+      )
+      sample_result.sampled?
+    rescue StandardError => e
+      logger.warn("Langfuse score sampling fallback for trace_id=#{trace_id}: #{e.message}")
+      true
+    end
+
+    # Sampler is pinned at ScoreClient construction to match the "sample_rate requires reset!"
+    # contract and to keep each client's sampling scoped to its own config.
+    attr_reader :score_sampler
 
     # Send a batch of events to the API
     #

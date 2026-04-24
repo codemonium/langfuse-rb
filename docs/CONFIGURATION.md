@@ -215,6 +215,22 @@ Used by scoring API and OpenTelemetry tracing export. See [SCORING.md](SCORING.m
 config.flush_interval = 5  # Flush more frequently
 ```
 
+#### `sample_rate`
+
+- **Type:** Float (`0.0..1.0`)
+- **Default:** `1.0`
+- **Description:** Deterministic sampling rate for traces and trace-linked scores, based on trace ID
+
+```ruby
+config.sample_rate = 0.1  # Sample ~10% of traces
+```
+
+`0.0` drops all traces, `1.0` preserves current always-on behavior.
+Trace-linked scores use the same `sample_rate` decision so the SDK does not create orphaned scores for sampled-out traces.
+Session-only and dataset-run-only scores are still sent because they are not tied to a sampled trace.
+
+For Ruby client instances, `sample_rate` is snapshotted when the client is built. Changing `config.sample_rate` later does not update that client's score sampler or the already-initialized trace sampler. Rebuild the client with `Langfuse.reset!` when changing sampling behavior.
+
 #### `logger`
 
 - **Type:** Logger
@@ -348,12 +364,15 @@ After the first successful tracing initialization, these settings require `Langf
 - `base_url`
 - `environment`
 - `release`
+- `sample_rate`
 - `should_export_span`
 - `tracing_async`
 - `batch_size`
 - `flush_interval`
 
 That includes processor tuning. Changing `batch_size` or `flush_interval` after tracing is already live will not rebuild the exporter pipeline until reset.
+
+The singleton client follows the same rule for score sampling: once `Langfuse.client` has been built, changing `sample_rate` on `Langfuse.configuration` does not change that client's trace-linked score sampling. Call `Langfuse.reset!`, configure again, and then rebuild the client.
 
 Performance note for `should_export_span`:
 
@@ -369,6 +388,7 @@ The SDK automatically reads these environment variables as defaults when no expl
 - `LANGFUSE_BASE_URL` — API endpoint (defaults to `https://cloud.langfuse.com`)
 - `LANGFUSE_TRACING_ENVIRONMENT` — default trace environment
 - `LANGFUSE_RELEASE` — default release identifier (falls back to common CI commit envs if present)
+- `LANGFUSE_SAMPLE_RATE` — trace sampling rate (`0.0..1.0`, defaults to `1.0`)
 
 Explicit configuration always takes precedence:
 
@@ -386,6 +406,7 @@ end
 LANGFUSE_PUBLIC_KEY=pk-lf-...
 LANGFUSE_SECRET_KEY=sk-lf-...
 LANGFUSE_BASE_URL=https://cloud.langfuse.com  # Optional
+LANGFUSE_SAMPLE_RATE=0.25                     # Optional
 ```
 
 ## Rails-Specific Configuration

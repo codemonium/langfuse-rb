@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-24
+
+### Added
+- Probabilistic trace sampling with score parity (#60)
+- Dataset run lifecycle methods: `get_dataset_run`, `list_dataset_runs`, `delete_dataset_run` (#62)
+
+### Fixed
+- Tracing is now isolated-by-default with lazy setup and smart export filtering (#77)
+
+### Documentation
+- Align docs with implementation (#78)
+
 ## [0.7.0] - 2026-04-14
 
 ### Added
@@ -88,7 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migrated from legacy ingestion API to OTLP endpoint
 - Removed `tracing_enabled` configuration flag (#2)
 
-[Unreleased]: https://github.com/simplepractice/langfuse-rb/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/simplepractice/langfuse-rb/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/simplepractice/langfuse-rb/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/simplepractice/langfuse-rb/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/simplepractice/langfuse-rb/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/simplepractice/langfuse-rb/compare/v0.4.0...v0.5.0

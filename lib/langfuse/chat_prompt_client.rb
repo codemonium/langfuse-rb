@@ -20,6 +20,8 @@ module Langfuse
   #   chat_prompt.labels    # => ["production"]
   #
   class ChatPromptClient
+    PLACEHOLDER_TYPE = "placeholder"
+
     # @return [String] Prompt name
     attr_reader :name
 
@@ -35,7 +37,7 @@ module Langfuse
     # @return [Hash] Prompt configuration
     attr_reader :config
 
-    # @return [Array<Hash>] Array of message hashes with role and content
+    # @return [Array<Hash>] Array of message hashes and placeholder entries
     attr_reader :prompt
 
     # @return [Boolean] Whether this client uses caller-provided fallback content
@@ -58,14 +60,17 @@ module Langfuse
       @is_fallback = is_fallback
     end
 
-    # Compile the chat prompt with variable substitution
+    # Compile the chat prompt with variable substitution and message placeholders
     #
     # Returns an array of message hashes with roles and compiled content.
-    # Each message in the prompt will have its content compiled with the
-    # provided variables using Mustache templating.
+    # Placeholder entries are resolved from keyword arguments: arrays are
+    # expanded, empty arrays are skipped, unresolved placeholders stay in the
+    # output, and malformed values raise before invalid messages are sent to
+    # an LLM provider.
     #
-    # @param kwargs [Hash] Variables to substitute in message templates (as keyword arguments)
-    # @return [Array<Hash>] Array of compiled messages with :role and :content keys
+    # @param kwargs [Hash] Variables and placeholder values to compile
+    # @return [Array<Hash>] Array of compiled messages and unresolved placeholders
+    # @raise [ArgumentError] if a placeholder value is malformed
     #
     # @example
     #   chat_prompt.compile(name: "Alice", topic: "Ruby")
@@ -74,9 +79,18 @@ module Langfuse
     #   #   { role: :user, content: "Hello Alice, let's discuss Ruby!" }
     #   # ]
     def compile(**kwargs)
-      prompt.map do |message|
-        compile_message(message, kwargs)
+      unresolved = []
+      compiled = []
+      prompt.each do |message|
+        normalized = symbolize_keys(message)
+        if normalized[:type].to_s == PLACEHOLDER_TYPE
+          append_placeholder(normalized, kwargs, compiled, unresolved)
+        else
+          compiled << compile_message(normalized, kwargs)
+        end
       end
+      warn_unresolved(unresolved)
+      compiled
     end
 
     private
@@ -93,19 +107,102 @@ module Langfuse
       raise ArgumentError, "prompt must be an Array" unless prompt_data["prompt"].is_a?(Array)
     end
 
-    # Compile a single message with variable substitution
+    # Compile a single role/content message with variable substitution
     #
-    # @param message [Hash] The message with role and content
+    # @param normalized [Hash] Symbolized message hash
     # @param variables [Hash] Variables to substitute
     # @return [Hash] Compiled message with :role and :content as symbols
-    def compile_message(message, variables)
-      content = message["content"] || ""
-      compiled_content = variables.empty? ? content : PromptRenderer.render(content, variables)
+    def compile_message(normalized, variables)
+      normalized.except(:type).merge(
+        role: normalize_role(normalized[:role]),
+        content: render(normalized[:content] || "", variables)
+      )
+    end
 
-      {
-        role: normalize_role(message["role"]),
-        content: compiled_content
-      }
+    # @api private
+    def append_placeholder(message, variables, compiled, unresolved)
+      name = message[:name].to_s
+      found, value = lookup_placeholder(variables, name)
+      return append_unresolved(name, compiled, unresolved) unless found
+
+      expand_placeholder(name, value, variables, compiled)
+    end
+
+    # @api private
+    def append_unresolved(name, compiled, unresolved)
+      unresolved << name
+      compiled << { type: PLACEHOLDER_TYPE, name: name }
+    end
+
+    # @api private
+    def expand_placeholder(name, value, variables, compiled)
+      return if value.is_a?(Array) && value.empty?
+
+      unless value.is_a?(Array)
+        raise ArgumentError, "Placeholder '#{name}' must contain an array of chat message hashes, got #{value.class}."
+      end
+
+      value.each { |entry| compiled << placeholder_message(entry, variables, name) }
+    end
+
+    # @api private
+    def lookup_placeholder(variables, name)
+      return [true, variables[name.to_sym]] if variables.key?(name.to_sym)
+      return [true, variables[name]] if variables.key?(name)
+
+      [false, nil]
+    end
+
+    # @api private
+    def placeholder_message(message, variables, name)
+      unless message.is_a?(Hash)
+        raise ArgumentError,
+              "Placeholder '#{name}' must contain an array of chat message hashes with role and content fields."
+      end
+
+      normalized = symbolize_keys(message)
+      unless valid_placeholder_message?(normalized)
+        raise ArgumentError,
+              "Placeholder '#{name}' must contain an array of chat message hashes with role and content fields."
+      end
+
+      normalized.merge(
+        role: normalize_role(normalized[:role]),
+        content: render(normalized[:content] || "", variables)
+      )
+    end
+
+    # @api private
+    def render(content, variables)
+      variables.empty? ? content : PromptRenderer.render(content, variables)
+    end
+
+    # @api private
+    def valid_placeholder_message?(message)
+      message.is_a?(Hash) &&
+        message.key?(:role) &&
+        !message[:role].to_s.empty? &&
+        message.key?(:content)
+    end
+
+    # @api private
+    def warn_unresolved(names)
+      return if names.empty?
+
+      unresolved_names = names.uniq.sort
+      message = "Placeholders #{unresolved_names.inspect} have not been resolved. " \
+                "Pass them as keyword arguments to compile()."
+      warn_msg(message)
+    end
+
+    # @api private
+    def warn_msg(message)
+      Langfuse.configuration.logger.warn("Langfuse: #{message}")
+    end
+
+    # @api private
+    def symbolize_keys(hash)
+      hash.transform_keys(&:to_sym)
     end
 
     # Normalize role to symbol

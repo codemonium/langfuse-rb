@@ -205,6 +205,120 @@ RSpec.describe Langfuse::ChatPromptClient do
       end
     end
 
+    context "with message placeholders" do
+      let(:placeholder_prompt_data) do
+        prompt_data.merge(
+          "prompt" => [
+            { "role" => "system", "content" => "You are a {{role}} assistant." },
+            { "type" => "placeholder", "name" => "history" },
+            { "role" => "user", "content" => "Help me with {{task}}." }
+          ]
+        )
+      end
+
+      let(:client) { described_class.new(placeholder_prompt_data) }
+
+      it "inserts placeholder messages and compiles their content" do
+        result = client.compile(
+          role: "helpful",
+          task: "billing",
+          history: [
+            { role: :user, content: "Show {{task}} context" },
+            { role: :assistant, content: "Prior answer", tool_calls: [{ id: "call_1" }] }
+          ]
+        )
+
+        expect(result).to eq([
+                               { role: :system, content: "You are a helpful assistant." },
+                               { role: :user, content: "Show billing context" },
+                               { role: :assistant, content: "Prior answer", tool_calls: [{ id: "call_1" }] },
+                               { role: :user, content: "Help me with billing." }
+                             ])
+      end
+
+      it "skips placeholders resolved to empty arrays" do
+        result = client.compile(role: "helpful", task: "billing", history: [])
+
+        expect(result).to eq([
+                               { role: :system, content: "You are a helpful assistant." },
+                               { role: :user, content: "Help me with billing." }
+                             ])
+      end
+
+      it "keeps unresolved placeholders and warns" do
+        expect(Langfuse.configuration.logger).to receive(:warn)
+          .with(/Placeholders \["history"\] have not been resolved/)
+
+        result = client.compile(role: "helpful", task: "billing")
+
+        expect(result).to eq([
+                               { role: :system, content: "You are a helpful assistant." },
+                               { type: "placeholder", name: "history" },
+                               { role: :user, content: "Help me with billing." }
+                             ])
+      end
+
+      it "deduplicates unresolved placeholder names in warnings" do
+        data = placeholder_prompt_data.merge(
+          "prompt" => [
+            { "type" => "placeholder", "name" => "history" },
+            { "type" => "placeholder", "name" => "examples" },
+            { "type" => "placeholder", "name" => "history" }
+          ]
+        )
+        client = described_class.new(data)
+
+        expect(Langfuse.configuration.logger).to receive(:warn)
+          .with(/Placeholders \["examples", "history"\] have not been resolved/)
+
+        client.compile
+      end
+
+      it "raises for non-array placeholder values" do
+        expect do
+          client.compile(role: "helpful", task: "billing", history: "not a list")
+        end.to raise_error(
+          ArgumentError,
+          "Placeholder 'history' must contain an array of chat message hashes, got String."
+        )
+      end
+
+      it "raises for malformed placeholder array entries" do
+        placeholder_value = [
+          "invalid message",
+          { "role" => "user", "content" => "valid {{task}} message" }
+        ]
+
+        expect do
+          client.compile(role: "helpful", task: "billing", history: placeholder_value)
+        end.to raise_error(
+          ArgumentError,
+          "Placeholder 'history' must contain an array of chat message hashes with role and content fields."
+        )
+      end
+
+      it "raises when placeholder messages are missing role or content" do
+        expect do
+          client.compile(role: "helpful", task: "billing", history: [{ role: :user }])
+        end.to raise_error(
+          ArgumentError,
+          "Placeholder 'history' must contain an array of chat message hashes with role and content fields."
+        )
+      end
+
+      it "strips message type metadata from compiled normal messages" do
+        data = prompt_data.merge(
+          "prompt" => [
+            { "type" => "message", "role" => "user", "content" => "Hi {{name}}" }
+          ]
+        )
+
+        result = described_class.new(data).compile(name: "Ada")
+
+        expect(result).to eq([{ role: :user, content: "Hi Ada" }])
+      end
+    end
+
     context "with complex templates" do
       it "handles nested object properties" do
         data = prompt_data.dup

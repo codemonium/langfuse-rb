@@ -856,7 +856,8 @@ module Langfuse
 
     # Normalize prompt content for API request
     #
-    # Converts Ruby symbol keys to string keys for chat messages
+    # Converts Ruby symbol keys to string keys for chat messages and preserves
+    # Langfuse message placeholder entries.
     #
     # @param prompt [String, Array] The prompt content
     # @param type [Symbol] The prompt type
@@ -866,17 +867,27 @@ module Langfuse
 
       # Normalize chat messages to use string keys
       prompt.map do |message|
-        # Convert all keys to symbols first, then extract
-        normalized = message.transform_keys do |k|
-          k.to_sym
-        rescue StandardError
-          k
-        end
-        {
-          "role" => normalized[:role]&.to_s,
-          "content" => normalized[:content]
-        }
+        normalized = message.transform_keys(&:to_s)
+        next placeholder_prompt_content(normalized) if normalized["type"] == ChatPromptClient::PLACEHOLDER_TYPE
+
+        normalize_chat_message_content(normalized)
       end
+    end
+
+    # @api private
+    def placeholder_prompt_content(message)
+      {
+        "type" => ChatPromptClient::PLACEHOLDER_TYPE,
+        "name" => message["name"].to_s
+      }
+    end
+
+    # @api private
+    def normalize_chat_message_content(message)
+      message.merge(
+        "role" => message["role"]&.to_s,
+        "content" => message["content"]
+      )
     end
   end
   # rubocop:enable Metrics/ClassLength

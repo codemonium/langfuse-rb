@@ -10,7 +10,9 @@ RSpec.describe Langfuse::TextPromptClient do
       "type" => "text",
       "labels" => ["production"],
       "tags" => ["customer-facing"],
-      "config" => { "temperature" => 0.7 }
+      "config" => { "temperature" => 0.7 },
+      "commitMessage" => "Initial version",
+      "resolutionGraph" => { "nodes" => [{ "name" => "shared-system" }] }
     }
   end
 
@@ -60,6 +62,21 @@ RSpec.describe Langfuse::TextPromptClient do
       expect(client.config).to eq({ "temperature" => 0.7 })
     end
 
+    it "sets the type" do
+      client = described_class.new(prompt_data)
+      expect(client.type).to eq("text")
+    end
+
+    it "sets the commit message" do
+      client = described_class.new(prompt_data)
+      expect(client.commit_message).to eq("Initial version")
+    end
+
+    it "sets the resolution graph" do
+      client = described_class.new(prompt_data)
+      expect(client.resolution_graph).to eq({ "nodes" => [{ "name" => "shared-system" }] })
+    end
+
     it "defaults labels to empty array when not provided" do
       data = prompt_data.dup.tap { |d| d.delete("labels") }
       client = described_class.new(data)
@@ -76,6 +93,17 @@ RSpec.describe Langfuse::TextPromptClient do
       data = prompt_data.dup.tap { |d| d.delete("config") }
       client = described_class.new(data)
       expect(client.config).to eq({})
+    end
+
+    it "defaults optional metadata when not provided" do
+      data = prompt_data.dup.tap do |d|
+        d.delete("commitMessage")
+        d.delete("resolutionGraph")
+      end
+      client = described_class.new(data)
+
+      expect(client.commit_message).to be_nil
+      expect(client.resolution_graph).to be_nil
     end
 
     context "with invalid prompt data" do

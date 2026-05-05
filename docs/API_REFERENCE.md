@@ -42,11 +42,12 @@ Block receives a `Langfuse::Config` object with these properties:
 | `timeout`                      | Integer | No       | `5`                            | HTTP timeout (seconds)            |
 | `cache_ttl`                    | Integer | No       | `60`                           | Prompt cache TTL (seconds)        |
 | `cache_max_size`               | Integer | No       | `1000`                         | Max cached prompts                |
-| `cache_backend`                | Symbol  | No       | `:memory`                      | `:memory` or `:rails`             |
+| `cache_backend`                | Symbol  | No       | `:memory`                      | `:memory`, `:rails`, or `:auto`   |
 | `cache_lock_timeout`           | Integer | No       | `10`                           | Lock timeout (seconds)            |
 | `cache_stale_while_revalidate` | Boolean | No       | `false`                        | Advisory SWR intent flag (effective activation depends on `cache_stale_ttl`) |
 | `cache_stale_ttl`              | Integer or `:indefinite` | No | `0`                  | Stale TTL (seconds, `>0` enables SWR) |
 | `cache_refresh_threads`        | Integer | No       | `5`                            | Background refresh threads        |
+| `prompt_cache_observer`        | Callable | No      | `nil`                          | Prompt cache event hook           |
 | `batch_size`                   | Integer | No       | `50`                           | Score + trace export batch size   |
 | `flush_interval`               | Integer | No       | `10`                           | Score + trace export interval (s) |
 | `sample_rate`                  | Float   | No       | `1.0`                          | Trace + trace-linked score sampling rate (`0.0..1.0`) |
@@ -215,7 +216,7 @@ Fetch a prompt from Langfuse (with caching).
 **Signature:**
 
 ```ruby
-get_prompt(name, version: nil, label: nil, fallback: nil, type: nil)
+get_prompt(name, version: nil, label: nil, fallback: nil, type: nil, cache_ttl: nil)
 ```
 
 **Parameters:**
@@ -227,6 +228,7 @@ get_prompt(name, version: nil, label: nil, fallback: nil, type: nil)
 | `label`    | String  | No          | Version label (e.g., "production")                   |
 | `fallback` | String or Array<Hash> | No | Fallback prompt if not found (`String` for text, `Array<Hash>` for chat) |
 | `type`     | Symbol  | Conditional | `:text` or `:chat` (required if `fallback` provided) |
+| `cache_ttl` | Integer | No | Per-call cache TTL override. `0` bypasses cache read/write |
 
 **Returns:** `Langfuse::TextPromptClient` or `Langfuse::ChatPromptClient`
 
@@ -257,6 +259,49 @@ prompt = client.get_prompt("new-prompt",
 
 See [PROMPTS.md](PROMPTS.md) for complete guide.
 
+### `Client#get_prompt_result`
+
+Fetch a prompt and return cache metadata.
+
+**Signature:**
+
+```ruby
+get_prompt_result(name, version: nil, label: nil, fallback: nil, type: nil, cache_ttl: nil)
+```
+
+**Returns:** `Langfuse::PromptFetchResult`
+
+| Attribute | Type | Description |
+| --------- | ---- | ----------- |
+| `prompt` | TextPromptClient or ChatPromptClient | Prompt client |
+| `logical_key` | String | Stable logical identity: name plus version or label/default production |
+| `storage_key` | String | Backend key for the current cache generation |
+| `cache_status` | Symbol | `:hit`, `:miss`, `:stale`, `:refresh`, `:bypass`, or `:disabled` |
+| `source` | Symbol | `:cache`, `:api`, or `:fallback` |
+| `fallback?` | Boolean | Whether fallback content was returned |
+
+```ruby
+result = client.get_prompt_result("greeting", label: "production")
+result.prompt.compile(name: "Ada")
+result.cache_status # => :miss
+```
+
+### Prompt Cache Operations
+
+Flat client APIs for operational prompt cache control:
+
+```ruby
+client.refresh_prompt("greeting", label: "production", cache_ttl: 60)
+client.invalidate_prompt_cache("greeting", label: "production")
+client.invalidate_prompt_cache_by_name("greeting")
+client.clear_prompt_cache
+client.prompt_cache_stats
+client.prompt_cache_key("greeting")
+client.validate_prompt_cache_backend!
+```
+
+`invalidate_prompt_cache_by_name` and `clear_prompt_cache` use generation counters. Rails.cache entries from old generations are not scanned; they become unreachable and expire by TTL.
+
 ### `Client#compile_prompt`
 
 Convenience method: fetch and compile in one call.
@@ -264,7 +309,7 @@ Convenience method: fetch and compile in one call.
 **Signature:**
 
 ```ruby
-compile_prompt(name, variables: {}, version: nil, label: nil, fallback: nil, type: nil)
+compile_prompt(name, variables: {}, version: nil, label: nil, fallback: nil, type: nil, cache_ttl: nil)
 ```
 
 **Parameters:**

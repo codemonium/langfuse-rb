@@ -6,6 +6,7 @@ require "base64"
 require "json"
 require "uri"
 require_relative "prompt_fetch_result"
+require_relative "prompt_cache_coordinator"
 
 module Langfuse
   # HTTP client for Langfuse API
@@ -24,14 +25,6 @@ module Langfuse
   #
   class ApiClient # rubocop:disable Metrics/ClassLength
     include PromptCacheEvents
-
-    # Bundles the resolved cache key with the per-call TTL override so private
-    # prompt-fetch helpers take one arg instead of four.
-    PromptFetchOptions = Struct.new(:key, :cache_ttl, keyword_init: true) do
-      def name = key.name
-      def version = key.version
-      def label = key.label
-    end
 
     # @return [String] Langfuse public API key
     attr_reader :public_key
@@ -69,8 +62,12 @@ module Langfuse
       @timeout = timeout
       @logger = logger || Logger.new($stdout, level: Logger::WARN)
       @cache = cache
-      @cache_backend_name = compute_cache_backend_name
       setup_prompt_cache_events(cache_observer: cache_observer)
+      @prompt_cache_coordinator = PromptCacheCoordinator.new(
+        cache: cache,
+        event_emitter: self,
+        fetch_prompt: ->(name, version:, label:) { fetch_prompt_from_api(name, version: version, label: label) }
+      )
     end
     # rubocop:enable Metrics/ParameterLists
 
@@ -105,15 +102,7 @@ module Langfuse
     #     puts "#{prompt['name']} (v#{prompt['version']})"
     #   end
     def list_prompts(page: nil, limit: nil)
-      with_faraday_error_handling do
-        params = { page: page, limit: limit }.compact
-
-        response = connection.get("/api/public/v2/prompts", params)
-        result = handle_response(response)
-
-        # API returns { data: [...], meta: {...} }
-        result["data"] || []
-      end
+      request(:get, "/api/public/v2/prompts", params: { page: page, limit: limit }.compact)["data"] || []
     end
 
     # Fetch a prompt from the Langfuse API
@@ -148,16 +137,7 @@ module Langfuse
     # @raise [UnauthorizedError] if authentication fails
     # @raise [ApiError] for other API errors
     def get_prompt_result(name, version: nil, label: nil, cache_ttl: nil)
-      validate_prompt_fetch_options!(version, label, cache_ttl)
-
-      options = PromptFetchOptions.new(
-        key: prompt_cache_key(name, version: version, label: label),
-        cache_ttl: cache_ttl
-      )
-      return fetch_uncached_prompt_result(options, CacheStatus::DISABLED) if cache.nil?
-      return fetch_uncached_prompt_result(options, CacheStatus::BYPASS) if cache_ttl&.zero?
-
-      fetch_cached_prompt_result(options)
+      @prompt_cache_coordinator.get_prompt_result(name, version: version, label: label, cache_ttl: cache_ttl)
     end
 
     # Refresh a prompt from the API, optionally writing through to cache.
@@ -173,14 +153,7 @@ module Langfuse
     # @raise [UnauthorizedError] if authentication fails
     # @raise [ApiError] for other API errors
     def refresh_prompt(name, version: nil, label: nil, cache_ttl: nil)
-      validate_prompt_fetch_options!(version, label, cache_ttl)
-
-      refresh_prompt_result(
-        PromptFetchOptions.new(
-          key: prompt_cache_key(name, version: version, label: label),
-          cache_ttl: cache_ttl
-        )
-      )
+      @prompt_cache_coordinator.refresh_prompt(name, version: version, label: label, cache_ttl: cache_ttl)
     end
 
     # Inspect the logical and generated cache keys for a prompt.
@@ -191,15 +164,7 @@ module Langfuse
     # @return [PromptCacheKey] Logical and generated cache keys
     # @raise [ArgumentError] if both version and label are provided
     def prompt_cache_key(name, version: nil, label: nil)
-      raise ArgumentError, "Cannot specify both version and label" if version && label
-
-      logical_key = PromptCache.build_key(name, version: version, label: label)
-      storage_key = if generated_storage_key_cache?
-                      cache.storage_key(logical_key, name: name)
-                    else
-                      logical_key
-                    end
-      PromptCacheKey.new(name: name, version: version, label: label, logical_key: logical_key, storage_key: storage_key)
+      @prompt_cache_coordinator.prompt_cache_key(name, version: version, label: label)
     end
 
     # Invalidate one exact logical prompt cache key.
@@ -210,13 +175,7 @@ module Langfuse
     # @return [PromptCacheKey] The invalidated key
     # @raise [ArgumentError] if both version and label are provided
     def invalidate_prompt_cache(name, version: nil, label: nil)
-      key = prompt_cache_key(name, version: version, label: label)
-      deleted = cache&.delete(key.storage_key) || false
-      emit_prompt_cache_event(:delete) { event_payload(key, CacheStatus::MISS, CacheSource::CACHE, deleted: deleted) }
-      emit_prompt_cache_event(:invalidate) do
-        event_payload(key, CacheStatus::MISS, CacheSource::CACHE, scope: :exact)
-      end
-      key
+      @prompt_cache_coordinator.invalidate_prompt_cache(name, version: version, label: label)
     end
 
     # Invalidate all cached variants for one prompt name.
@@ -224,29 +183,33 @@ module Langfuse
     # @param name [String] The prompt name
     # @return [Integer, nil] New generation, or nil when cache is disabled
     def invalidate_prompt_cache_by_name(name)
-      generation = cache&.invalidate_name(name)
-      payload = { name: name, backend: cache_backend_name, generation: generation, scope: :name }
-      emit_prompt_cache_event(:invalidate, payload)
-      generation
+      @prompt_cache_coordinator.invalidate_prompt_cache_by_name(name)
     end
 
     # Logically clear the whole Langfuse prompt cache namespace.
     #
     # @return [Integer, nil] New global generation, or nil when cache is disabled
     def clear_prompt_cache
-      generation = cache&.clear_logically
-      emit_prompt_cache_event(:clear, backend: cache_backend_name, generation: generation)
-      generation
+      @prompt_cache_coordinator.clear_prompt_cache
     end
 
     # Return prompt cache statistics.
     #
     # @return [Hash] Cache statistics
     def prompt_cache_stats
-      return disabled_prompt_cache_stats unless cache
-
-      cache.stats
+      @prompt_cache_coordinator.prompt_cache_stats
     end
+
+    # Validate the configured prompt cache backend.
+    #
+    # @return [Boolean] true when the configured backend is usable
+    # @raise [ConfigurationError] if the backend is invalid
+    # rubocop:disable Naming/PredicateMethod
+    def validate_prompt_cache_backend!
+      @cache&.validate!
+      true
+    end
+    # rubocop:enable Naming/PredicateMethod
 
     # Create a new prompt (or new version if prompt with same name exists)
     #
@@ -271,21 +234,12 @@ module Langfuse
     #
     # rubocop:disable Metrics/ParameterLists
     def create_prompt(name:, prompt:, type:, config: {}, labels: [], tags: [], commit_message: nil)
-      with_faraday_error_handling do
-        path = "/api/public/v2/prompts"
-        payload = {
-          name: name,
-          prompt: prompt,
-          type: type,
-          config: config,
-          labels: labels,
-          tags: tags
-        }
-        payload[:commitMessage] = commit_message if commit_message
-
-        response = connection.post(path, payload)
-        handle_response(response).tap { invalidate_prompt_cache_after_mutation(name) }
-      end
+      payload = {
+        name: name, prompt: prompt, type: type, config: config,
+        labels: labels, tags: tags, commitMessage: commit_message
+      }.compact
+      request(:post, "/api/public/v2/prompts", body: payload)
+        .tap { @prompt_cache_coordinator.invalidate_after_mutation(name) }
     end
     # rubocop:enable Metrics/ParameterLists
 
@@ -309,13 +263,9 @@ module Langfuse
     def update_prompt(name:, version:, labels:)
       raise ArgumentError, "labels must be an array" unless labels.is_a?(Array)
 
-      with_faraday_error_handling do
-        path = "/api/public/v2/prompts/#{URI.encode_uri_component(name)}/versions/#{version}"
-        payload = { newLabels: labels }
-
-        response = connection.patch(path, payload)
-        handle_response(response).tap { invalidate_prompt_cache_after_mutation(name) }
-      end
+      path = "/api/public/v2/prompts/#{URI.encode_uri_component(name)}/versions/#{version}"
+      request(:patch, path, body: { newLabels: labels })
+        .tap { @prompt_cache_coordinator.invalidate_after_mutation(name) }
     end
 
     # Send a batch of events to the Langfuse ingestion API
@@ -344,13 +294,9 @@ module Langfuse
       raise ArgumentError, "events must be an array" unless events.is_a?(Array)
       raise ArgumentError, "events array cannot be empty" if events.empty?
 
-      path = "/api/public/ingestion"
-      payload = { batch: events }
-
-      response = connection.post(path, payload)
+      response = connection.post("/api/public/ingestion", { batch: events })
       handle_batch_response(response)
     rescue Faraday::RetriableResponse => e
-      # Retry middleware exhausted all retries - handle the final response
       logger.error("Langfuse batch send failed: Retries exhausted - #{e.response.status}")
       handle_batch_response(e.response)
     rescue Faraday::Error => e
@@ -374,16 +320,12 @@ module Langfuse
     #   api_client.create_dataset_run_item(dataset_item_id: "item-123", run_name: "eval-v1", trace_id: "trace-abc")
     def create_dataset_run_item(dataset_item_id:, run_name:, trace_id: nil,
                                 observation_id: nil, metadata: nil, run_description: nil)
-      with_faraday_error_handling do
-        payload = { datasetItemId: dataset_item_id, runName: run_name }
-        payload[:traceId] = trace_id if trace_id
-        payload[:observationId] = observation_id if observation_id
-        payload[:metadata] = metadata if metadata
-        payload[:runDescription] = run_description if run_description
-
-        response = connection.post("/api/public/dataset-run-items", payload)
-        handle_response(response)
-      end
+      payload = {
+        datasetItemId: dataset_item_id, runName: run_name,
+        traceId: trace_id, observationId: observation_id,
+        metadata: metadata, runDescription: run_description
+      }.compact
+      request(:post, "/api/public/dataset-run-items", body: payload)
     end
 
     # Fetch a dataset run by dataset and run name
@@ -395,10 +337,7 @@ module Langfuse
     # @raise [UnauthorizedError] if authentication fails
     # @raise [ApiError] for other API errors
     def get_dataset_run(dataset_name:, run_name:)
-      with_faraday_error_handling do
-        response = connection.get(dataset_run_path(dataset_name: dataset_name, run_name: run_name))
-        handle_response(response)
-      end
+      request(:get, dataset_run_path(dataset_name: dataset_name, run_name: run_name))
     end
 
     # List dataset runs in a dataset
@@ -410,8 +349,7 @@ module Langfuse
     # @raise [UnauthorizedError] if authentication fails
     # @raise [ApiError] for other API errors
     def list_dataset_runs(dataset_name:, page: nil, limit: nil)
-      result = list_dataset_runs_paginated(dataset_name: dataset_name, page: page, limit: limit)
-      result["data"] || []
+      list_dataset_runs_paginated(dataset_name: dataset_name, page: page, limit: limit)["data"] || []
     end
 
     # Full paginated response including "meta" for internal pagination use
@@ -419,10 +357,7 @@ module Langfuse
     # @api private
     # @return [Hash] Full response hash with "data" array and "meta" pagination info
     def list_dataset_runs_paginated(dataset_name:, page: nil, limit: nil)
-      with_faraday_error_handling do
-        response = connection.get(dataset_runs_path(dataset_name), build_dataset_runs_params(page: page, limit: limit))
-        handle_response(response)
-      end
+      request(:get, dataset_runs_path(dataset_name), params: { page: page, limit: limit }.compact)
     end
 
     # Delete a dataset run by name
@@ -451,19 +386,16 @@ module Langfuse
     #   data = api_client.get_projects
     #   project_id = data["data"][0]["id"]
     def get_projects # rubocop:disable Naming/AccessorMethodName
-      with_faraday_error_handling do
-        response = connection.get("/api/public/projects")
-        handle_response(response)
-      end
+      request(:get, "/api/public/projects")
     end
 
     # Shut down the API client and release resources
     #
-    # Shuts down the cache if it supports shutdown (e.g., SWR thread pool).
+    # Shuts down the cache backend's SWR thread pool when present.
     #
     # @return [void]
     def shutdown
-      cache.shutdown if cache.respond_to?(:shutdown)
+      @cache&.shutdown
     end
 
     # List traces in the project
@@ -493,14 +425,13 @@ module Langfuse
                     from_timestamp: nil, to_timestamp: nil, order_by: nil,
                     tags: nil, version: nil, release: nil, environment: nil,
                     fields: nil, filter: nil)
-      result = list_traces_paginated(
+      list_traces_paginated(
         page: page, limit: limit, user_id: user_id, name: name,
         session_id: session_id, from_timestamp: from_timestamp,
         to_timestamp: to_timestamp, order_by: order_by, tags: tags,
         version: version, release: release, environment: environment,
         fields: fields, filter: filter
-      )
-      result["data"] || []
+      )["data"] || []
     end
     # rubocop:enable Metrics/ParameterLists
 
@@ -513,17 +444,14 @@ module Langfuse
                               from_timestamp: nil, to_timestamp: nil, order_by: nil,
                               tags: nil, version: nil, release: nil, environment: nil,
                               fields: nil, filter: nil)
-      with_faraday_error_handling do
-        params = build_traces_params(
-          page: page, limit: limit, user_id: user_id, name: name,
-          session_id: session_id, from_timestamp: from_timestamp,
-          to_timestamp: to_timestamp, order_by: order_by, tags: tags,
-          version: version, release: release, environment: environment,
-          fields: fields, filter: filter
-        )
-        response = connection.get("/api/public/traces", params)
-        handle_response(response)
-      end
+      params = build_traces_params(
+        page: page, limit: limit, user_id: user_id, name: name,
+        session_id: session_id, from_timestamp: from_timestamp,
+        to_timestamp: to_timestamp, order_by: order_by, tags: tags,
+        version: version, release: release, environment: environment,
+        fields: fields, filter: filter
+      )
+      request(:get, "/api/public/traces", params: params)
     end
     # rubocop:enable Metrics/ParameterLists
 
@@ -538,11 +466,7 @@ module Langfuse
     # @example
     #   trace = api_client.get_trace("trace-uuid-123")
     def get_trace(id)
-      with_faraday_error_handling do
-        encoded_id = URI.encode_uri_component(id)
-        response = connection.get("/api/public/traces/#{encoded_id}")
-        handle_response(response)
-      end
+      request(:get, "/api/public/traces/#{URI.encode_uri_component(id)}")
     end
 
     # List all datasets in the project
@@ -556,13 +480,7 @@ module Langfuse
     # @example
     #   datasets = api_client.list_datasets(page: 1, limit: 10)
     def list_datasets(page: nil, limit: nil)
-      with_faraday_error_handling do
-        params = { page: page, limit: limit }.compact
-
-        response = connection.get("/api/public/v2/datasets", params)
-        result = handle_response(response)
-        result["data"] || []
-      end
+      request(:get, "/api/public/v2/datasets", params: { page: page, limit: limit }.compact)["data"] || []
     end
 
     # Fetch a dataset by name
@@ -576,11 +494,7 @@ module Langfuse
     # @example
     #   data = api_client.get_dataset("my-dataset")
     def get_dataset(name)
-      with_faraday_error_handling do
-        encoded_name = URI.encode_uri_component(name)
-        response = connection.get("/api/public/v2/datasets/#{encoded_name}")
-        handle_response(response)
-      end
+      request(:get, "/api/public/v2/datasets/#{URI.encode_uri_component(name)}")
     end
 
     # Create a new dataset
@@ -595,12 +509,8 @@ module Langfuse
     # @example
     #   data = api_client.create_dataset(name: "my-dataset", description: "QA evaluation set")
     def create_dataset(name:, description: nil, metadata: nil)
-      with_faraday_error_handling do
-        payload = { name: name, description: description, metadata: metadata }.compact
-
-        response = connection.post("/api/public/v2/datasets", payload)
-        handle_response(response)
-      end
+      request(:post, "/api/public/v2/datasets",
+              body: { name: name, description: description, metadata: metadata }.compact)
     end
 
     # Create a new dataset item (or upsert if id is provided)
@@ -627,16 +537,13 @@ module Langfuse
     def create_dataset_item(dataset_name:, input: nil, expected_output: nil,
                             metadata: nil, id: nil, source_trace_id: nil,
                             source_observation_id: nil, status: nil)
-      with_faraday_error_handling do
-        payload = build_dataset_item_payload(
-          dataset_name: dataset_name, input: input, expected_output: expected_output,
-          metadata: metadata, id: id, source_trace_id: source_trace_id,
-          source_observation_id: source_observation_id, status: status
-        )
-
-        response = connection.post("/api/public/dataset-items", payload)
-        handle_response(response)
-      end
+      payload = {
+        datasetName: dataset_name, id: id, input: input,
+        expectedOutput: expected_output, metadata: metadata,
+        sourceTraceId: source_trace_id, sourceObservationId: source_observation_id,
+        status: status&.to_s&.upcase
+      }.compact
+      request(:post, "/api/public/dataset-items", body: payload)
     end
     # rubocop:enable Metrics/ParameterLists
 
@@ -651,11 +558,7 @@ module Langfuse
     # @example
     #   data = api_client.get_dataset_item("item-uuid-123")
     def get_dataset_item(id)
-      with_faraday_error_handling do
-        encoded_id = URI.encode_uri_component(id)
-        response = connection.get("/api/public/dataset-items/#{encoded_id}")
-        handle_response(response)
-      end
+      request(:get, "/api/public/dataset-items/#{URI.encode_uri_component(id)}")
     end
 
     # List items in a dataset with optional filters
@@ -671,13 +574,8 @@ module Langfuse
     #
     # @example
     #   items = api_client.list_dataset_items(dataset_name: "my-dataset", limit: 50)
-    def list_dataset_items(dataset_name:, page: nil, limit: nil,
-                           source_trace_id: nil, source_observation_id: nil)
-      result = list_dataset_items_paginated(
-        dataset_name: dataset_name, page: page, limit: limit,
-        source_trace_id: source_trace_id, source_observation_id: source_observation_id
-      )
-      result["data"] || []
+    def list_dataset_items(**)
+      list_dataset_items_paginated(**)["data"] || []
     end
 
     # Full paginated response including "meta" for internal pagination use
@@ -686,15 +584,11 @@ module Langfuse
     # @return [Hash] Full response hash with "data" array and "meta" pagination info
     def list_dataset_items_paginated(dataset_name:, page: nil, limit: nil,
                                      source_trace_id: nil, source_observation_id: nil)
-      with_faraday_error_handling do
-        params = build_dataset_items_params(
-          dataset_name: dataset_name, page: page, limit: limit,
-          source_trace_id: source_trace_id, source_observation_id: source_observation_id
-        )
-
-        response = connection.get("/api/public/dataset-items", params)
-        handle_response(response)
-      end
+      params = {
+        datasetName: dataset_name, page: page, limit: limit,
+        sourceTraceId: source_trace_id, sourceObservationId: source_observation_id
+      }.compact
+      request(:get, "/api/public/dataset-items", params: params)
     end
 
     # Delete a dataset item by ID
@@ -708,8 +602,7 @@ module Langfuse
     # @example
     #   api_client.delete_dataset_item("item-uuid-123")
     def delete_dataset_item(id)
-      encoded_id = URI.encode_uri_component(id)
-      response = connection.delete("/api/public/dataset-items/#{encoded_id}")
+      response = connection.delete("/api/public/dataset-items/#{URI.encode_uri_component(id)}")
       handle_delete_dataset_item_response(response, id)
     rescue Faraday::RetriableResponse => e
       logger.error("Faraday error: Retries exhausted - #{e.response.status}")
@@ -721,314 +614,42 @@ module Langfuse
 
     private
 
-    def validate_prompt_fetch_options!(version, label, cache_ttl)
-      raise ArgumentError, "Cannot specify both version and label" if version && label
-      return if cache_ttl.nil?
-      raise ArgumentError, "cache_ttl must be a non-negative Integer" unless cache_ttl.is_a?(Integer)
-      raise ArgumentError, "cache_ttl must be non-negative" if cache_ttl.negative?
+    def cache_backend_name
+      @prompt_cache_coordinator.backend_name
     end
 
-    def fetch_uncached_prompt_result(options, cache_status)
-      prompt_data = fetch_prompt_for_options(options)
-      build_prompt_result(options.key, prompt_data, cache_status, CacheSource::API)
-    end
-
-    def fetch_cached_prompt_result(options)
-      return fetch_swr_prompt_result(options) if swr_cache_available?
-
-      fetch_non_swr_prompt_result(options)
-    end
-
-    def fetch_swr_prompt_result(options)
-      unless generated_storage_key_cache?
-        prompt_data = fetch_with_swr_cache(options.key.storage_key, options.name, options.version, options.label)
-        return cache_hit_prompt_result(options.key, prompt_data)
-      end
-
-      result = fetch_swr_cached_prompt_result(options)
-      return result if result
-
-      fetch_cache_miss_prompt_result(options, swr_enabled: true, distributed_enabled: false)
-    end
-
-    def fetch_non_swr_prompt_result(options)
-      distributed_enabled = distributed_cache_available?
-
-      if !generated_storage_key_cache? && distributed_enabled
-        prompt_data = fetch_with_distributed_cache(options.key.storage_key, options.name, options.version,
-                                                   options.label)
-        return cache_hit_prompt_result(options.key, prompt_data)
-      end
-
-      cached_data = cache.get(options.key.storage_key)
-      return cache_hit_prompt_result(options.key, cached_data) if cached_data
-
-      fetch_cache_miss_prompt_result(options, swr_enabled: false, distributed_enabled: distributed_enabled)
-    end
-
-    def fetch_swr_cached_prompt_result(options)
-      key = options.key
-      entry = cache.entry(key.storage_key) if cache.respond_to?(:entry)
-      return nil unless entry.respond_to?(:fresh?)
-      return cache_hit_prompt_result(key, entry.data) if entry.fresh?
-      return nil unless entry.stale?
-
-      emit_prompt_cache_event(:stale_serve) { event_payload(key, CacheStatus::STALE, CacheSource::CACHE) }
-      schedule_prompt_cache_refresh(options)
-      build_prompt_result(key, entry.data, CacheStatus::STALE, CacheSource::CACHE)
-    end
-
-    def cache_hit_prompt_result(key, prompt_data)
-      emit_prompt_cache_event(:hit) { event_payload(key, CacheStatus::HIT, CacheSource::CACHE) }
-      build_prompt_result(key, prompt_data, CacheStatus::HIT, CacheSource::CACHE)
-    end
-
-    def fetch_cache_miss_prompt_result(options, swr_enabled: false, distributed_enabled: nil)
-      emit_prompt_cache_event(:miss) { event_payload(options.key, CacheStatus::MISS, CacheSource::API) }
-      distributed_enabled = distributed_cache_available? if distributed_enabled.nil?
-
-      if !swr_enabled && distributed_enabled
-        fetch_cache_miss_with_lock(options)
-      else
-        fetch_cache_miss_directly(options, swr_enabled: swr_enabled)
+    # Issue an HTTP request, raise on Faraday errors, parse the response.
+    #
+    # @api private
+    # @param verb [Symbol] HTTP verb (:get, :post, :patch, :delete)
+    # @param path [String] Request path
+    # @param params [Hash, nil] Query string params (GET/DELETE)
+    # @param body [Hash, nil] JSON body (POST/PATCH)
+    # @return [Hash] Parsed response body
+    def request(verb, path, params: nil, body: nil)
+      with_faraday_error_handling do
+        handle_response(connection.public_send(verb, path, body || params))
       end
     end
 
-    def fetch_cache_miss_with_lock(options)
-      key = options.key
-      fetched = false
-      prompt_data = cache_fetch_with_lock(key.storage_key, options.cache_ttl) do
-        fetched = true
-        fetch_prompt_for_options(options)
-      end
-      emit_prompt_cache_event(:write) { event_payload(key, CacheStatus::MISS, CacheSource::API) } if fetched
-      status = fetched ? CacheStatus::MISS : CacheStatus::HIT
-      source = fetched ? CacheSource::API : CacheSource::CACHE
-      build_prompt_result(key, prompt_data, status, source)
-    end
-
-    def fetch_cache_miss_directly(options, swr_enabled: false)
-      prompt_data = fetch_prompt_for_options(options)
-      write_prompt_cache(options.key, prompt_data, options.cache_ttl, swr_enabled: swr_enabled)
-      build_prompt_result(options.key, prompt_data, CacheStatus::MISS, CacheSource::API)
-    end
-
-    def refresh_prompt_result(options)
-      key = options.key
-      emit_prompt_cache_event(:refresh_start) { event_payload(key, CacheStatus::REFRESH, CacheSource::API) }
-      prompt_data = fetch_prompt_for_options(options)
-      write_refresh_prompt_cache(key, prompt_data, options.cache_ttl)
-      status = refresh_cache_status(options.cache_ttl)
-      emit_prompt_cache_event(:refresh_success) { event_payload(key, status, CacheSource::API) }
-      build_prompt_result(key, prompt_data, status, CacheSource::API)
-    rescue StandardError => e
-      emit_prompt_cache_event(:refresh_failure) do
-        event_payload(key, CacheStatus::REFRESH, CacheSource::API,
-                      error_class: e.class.name, error_message: e.message)
-      end
-      raise
-    end
-
-    def schedule_prompt_cache_refresh(options)
-      return unless cache.respond_to?(:refresh_async)
-
-      key = options.key
-      scheduled = cache.refresh_async(
-        key.storage_key,
-        ttl: options.cache_ttl,
-        on_success: ->(_value) { emit_refresh_success_events(key) },
-        on_failure: ->(error) { emit_refresh_failure_event(key, error) }
-      ) { fetch_prompt_for_options(options) }
-      return unless scheduled
-
-      emit_prompt_cache_event(:refresh_start) { event_payload(key, CacheStatus::STALE, CacheSource::CACHE) }
-    end
-
-    def fetch_prompt_for_options(options)
-      fetch_prompt_from_api(options.name, version: options.version, label: options.label)
-    end
-
-    def emit_refresh_success_events(key)
-      emit_prompt_cache_event(:refresh_success) { event_payload(key, CacheStatus::REFRESH, CacheSource::API) }
-      emit_prompt_cache_event(:write) { event_payload(key, CacheStatus::REFRESH, CacheSource::API) }
-    end
-
-    def emit_refresh_failure_event(key, error)
-      emit_prompt_cache_event(:refresh_failure) do
-        event_payload(key, CacheStatus::STALE, CacheSource::CACHE,
-                      error_class: error.class.name, error_message: error.message)
-      end
-    end
-
-    def write_refresh_prompt_cache(key, prompt_data, cache_ttl)
-      return unless cache
-      return if cache_ttl&.zero?
-
-      write_prompt_cache(key, prompt_data, cache_ttl,
-                         cache_status: CacheStatus::REFRESH, swr_enabled: swr_cache_available?)
-    end
-
-    def write_prompt_cache(key, prompt_data, cache_ttl, cache_status: CacheStatus::MISS, swr_enabled: false)
-      if swr_enabled && cache.respond_to?(:write_with_stale_while_revalidate)
-        cache.write_with_stale_while_revalidate(key.storage_key, prompt_data, ttl: cache_ttl)
-      elsif cache_ttl.nil?
-        cache.set(key.storage_key, prompt_data)
-      else
-        cache.set(key.storage_key, prompt_data, ttl: cache_ttl)
-      end
-      emit_prompt_cache_event(:write) { event_payload(key, cache_status, CacheSource::API) }
-    end
-
-    def cache_fetch_with_lock(storage_key, cache_ttl, &)
-      return cache.fetch_with_lock(storage_key, &) if cache_ttl.nil?
-
-      cache.fetch_with_lock(storage_key, ttl: cache_ttl, &)
-    end
-
-    def refresh_cache_status(cache_ttl)
-      return CacheStatus::DISABLED unless cache
-      return CacheStatus::BYPASS if cache_ttl&.zero?
-
-      CacheStatus::REFRESH
-    end
-
-    def build_prompt_result(key, prompt_data, cache_status, source)
-      PromptFetchResult.new(
-        prompt: prompt_data,
-        logical_key: key.logical_key,
-        storage_key: key.storage_key,
-        cache_status: cache_status,
-        source: source,
-        name: prompt_data["name"] || key.name,
-        version: prompt_data["version"] || key.version,
-        label: key.resolved_label
-      )
-    end
-
-    attr_reader :cache_backend_name
-
-    def compute_cache_backend_name
-      return CacheBackend::DISABLED unless cache
-      return CacheBackend::RAILS if cache.is_a?(RailsCacheAdapter)
-      return CacheBackend::MEMORY if cache.is_a?(PromptCache)
-
-      cache.class.name
-    end
-
-    def disabled_prompt_cache_stats
+    def build_traces_params(**options)
       {
-        backend: CacheBackend::DISABLED,
-        enabled: false,
-        current_generation_entries: nil,
-        orphaned_entries: nil,
-        total_entries: nil,
-        unsupported_counts: CacheBackend::UNSUPPORTED_COUNT_KEYS
-      }
-    end
-
-    def generated_storage_key_cache?
-      cache.is_a?(PromptCache) || cache.is_a?(RailsCacheAdapter)
-    end
-
-    def invalidate_prompt_cache_after_mutation(name)
-      generation = cache&.invalidate_name(name)
-      payload = { name: name, backend: cache_backend_name, generation: generation, scope: :name, mutation: true }
-      emit_prompt_cache_event(:invalidate, payload)
-    end
-
-    # Check if SWR cache is available
-    def swr_cache_available?
-      cache.respond_to?(:swr_enabled?) && cache.swr_enabled?
-    end
-
-    # Check if distributed cache is available
-    def distributed_cache_available?
-      cache.respond_to?(:fetch_with_lock)
-    end
-
-    # Build payload for create_dataset_item
-    # rubocop:disable Metrics/ParameterLists
-    def build_dataset_item_payload(dataset_name:, input:, expected_output:,
-                                   metadata:, id:, source_trace_id:,
-                                   source_observation_id:, status:)
-      { datasetName: dataset_name }.tap do |payload|
-        add_optional_dataset_item_fields(payload, input, expected_output, metadata, id)
-        add_optional_source_fields(payload, source_trace_id, source_observation_id, status)
-      end
-    end
-    # rubocop:enable Metrics/ParameterLists
-
-    def add_optional_dataset_item_fields(payload, input, expected_output, metadata, id)
-      payload[:id] = id if id
-      payload[:input] = input if input
-      payload[:expectedOutput] = expected_output if expected_output
-      payload[:metadata] = metadata if metadata
-    end
-
-    def add_optional_source_fields(payload, source_trace_id, source_observation_id, status)
-      payload[:sourceTraceId] = source_trace_id if source_trace_id
-      payload[:sourceObservationId] = source_observation_id if source_observation_id
-      payload[:status] = status.to_s.upcase if status
-    end
-
-    # Build params for list_dataset_items
-    def build_dataset_items_params(dataset_name:, page:, limit:,
-                                   source_trace_id:, source_observation_id:)
-      {
-        datasetName: dataset_name,
-        page: page,
-        limit: limit,
-        sourceTraceId: source_trace_id,
-        sourceObservationId: source_observation_id
+        page: options[:page], limit: options[:limit], userId: options[:user_id], name: options[:name],
+        sessionId: options[:session_id],
+        fromTimestamp: options[:from_timestamp]&.iso8601,
+        toTimestamp: options[:to_timestamp]&.iso8601,
+        orderBy: options[:order_by], tags: options[:tags], version: options[:version],
+        release: options[:release], environment: options[:environment], fields: options[:fields],
+        filter: options[:filter]
       }.compact
     end
 
-    # Build params for list_dataset_runs
-    def build_dataset_runs_params(page:, limit:)
-      { page: page, limit: limit }.compact
-    end
-
-    # Build endpoint path for dataset runs
     def dataset_runs_path(dataset_name)
-      encoded_name = URI.encode_uri_component(dataset_name)
-      "/api/public/datasets/#{encoded_name}/runs"
+      "/api/public/datasets/#{URI.encode_uri_component(dataset_name)}/runs"
     end
 
-    # Build endpoint path for a specific dataset run
     def dataset_run_path(dataset_name:, run_name:)
-      encoded_run_name = URI.encode_uri_component(run_name)
-      "#{dataset_runs_path(dataset_name)}/#{encoded_run_name}"
-    end
-
-    # Build query params for list_traces, mapping snake_case to camelCase
-    # rubocop:disable Metrics/ParameterLists
-    def build_traces_params(page:, limit:, user_id:, name:, session_id:,
-                            from_timestamp:, to_timestamp:, order_by:,
-                            tags:, version:, release:, environment:, fields:, filter:)
-      {
-        page: page, limit: limit, userId: user_id, name: name,
-        sessionId: session_id,
-        fromTimestamp: from_timestamp&.iso8601,
-        toTimestamp: to_timestamp&.iso8601,
-        orderBy: order_by, tags: tags, version: version,
-        release: release, environment: environment, fields: fields,
-        filter: filter
-      }.compact
-    end
-    # rubocop:enable Metrics/ParameterLists
-
-    # Fetch with SWR cache
-    def fetch_with_swr_cache(cache_key, name, version, label)
-      cache.fetch_with_stale_while_revalidate(cache_key) do
-        fetch_prompt_from_api(name, version: version, label: label)
-      end
-    end
-
-    # Fetch with distributed cache (Rails.cache with stampede protection)
-    def fetch_with_distributed_cache(cache_key, name, version, label)
-      cache.fetch_with_lock(cache_key) do
-        fetch_prompt_from_api(name, version: version, label: label)
-      end
+      "#{dataset_runs_path(dataset_name)}/#{URI.encode_uri_component(run_name)}"
     end
 
     # Fetch a prompt from the API (without caching)
@@ -1041,13 +662,8 @@ module Langfuse
     # @raise [UnauthorizedError] if authentication fails
     # @raise [ApiError] for other API errors
     def fetch_prompt_from_api(name, version: nil, label: nil)
-      with_faraday_error_handling do
-        params = build_prompt_params(version: version, label: label)
-        path = "/api/public/v2/prompts/#{URI.encode_uri_component(name)}"
-
-        response = connection.get(path, params)
-        handle_response(response)
-      end
+      path = "/api/public/v2/prompts/#{URI.encode_uri_component(name)}"
+      request(:get, path, params: { version: version, label: label }.compact)
     end
 
     # Build a new Faraday connection
@@ -1114,15 +730,6 @@ module Langfuse
     # @return [String]
     def user_agent
       "langfuse-rb/#{Langfuse::VERSION}"
-    end
-
-    # Build query parameters for prompt request
-    #
-    # @param version [Integer, nil] Optional version number
-    # @param label [String, nil] Optional label
-    # @return [Hash] Query parameters
-    def build_prompt_params(version: nil, label: nil)
-      { version: version, label: label }.compact
     end
 
     # Wrap a block with standard Faraday error handling.

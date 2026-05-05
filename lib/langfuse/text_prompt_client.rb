@@ -35,7 +35,7 @@ module Langfuse
     # @return [Hash] Prompt configuration
     attr_reader :config
 
-    # @return [String] Raw prompt template string
+    # @return [String] Raw prompt template
     attr_reader :prompt
 
     # @return [String, nil] Optional commit message for this prompt version
@@ -75,6 +75,7 @@ module Langfuse
     #
     # @param kwargs [Hash] Variables to substitute in the template (as keyword arguments)
     # @return [String] The compiled prompt text
+    # @raise [ArgumentError] if variables cannot be rendered
     #
     # @example
     #   text_prompt.compile(name: "Alice", greeting: "Hi")
@@ -87,10 +88,6 @@ module Langfuse
 
     private
 
-    # Validate prompt data structure
-    #
-    # @param prompt_data [Hash] The prompt data to validate
-    # @raise [ArgumentError] if validation fails
     def validate_prompt_data!(prompt_data)
       raise ArgumentError, "prompt_data must be a Hash" unless prompt_data.is_a?(Hash)
       raise ArgumentError, "prompt_data must include 'prompt' field" unless prompt_data.key?("prompt")

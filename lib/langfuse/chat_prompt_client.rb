@@ -28,6 +28,9 @@ module Langfuse
     # @return [Integer] Prompt version number
     attr_reader :version
 
+    # @return [Array<Hash>] Raw prompt template (array of role/content message hashes)
+    attr_reader :prompt
+
     # @return [Array<String>] Labels assigned to this prompt
     attr_reader :labels
 
@@ -36,9 +39,6 @@ module Langfuse
 
     # @return [Hash] Prompt configuration
     attr_reader :config
-
-    # @return [Array<Hash>] Array of message hashes and placeholder entries
-    attr_reader :prompt
 
     # @return [String, nil] Optional commit message for this prompt version
     attr_reader :commit_message

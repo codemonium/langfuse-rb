@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-05-05
+
+### Changed
+- Refactor prompt cache internals (#91)
+
 ## [0.10.0] - 2026-05-05
 
 ### Added
@@ -124,7 +129,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migrated from legacy ingestion API to OTLP endpoint
 - Removed `tracing_enabled` configuration flag (#2)
 
-[Unreleased]: https://github.com/simplepractice/langfuse-rb/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/simplepractice/langfuse-rb/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/simplepractice/langfuse-rb/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/simplepractice/langfuse-rb/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/simplepractice/langfuse-rb/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/simplepractice/langfuse-rb/compare/v0.7.0...v0.8.0

@@ -211,15 +211,13 @@ module Langfuse
     # @param value [Object] Value to cache
     # @return [Object] The cached value
     def set_cache_entry(key, value, ttl: nil, stale_ttl: nil)
-      now = Time.now
+      # TTL math is inlined (not extracted to a helper) to keep this hot write
+      # path allocation-free apart from the CacheEntry below.
       effective_ttl = ttl.nil? ? self.ttl : ttl
       effective_stale_ttl = stale_ttl.nil? ? self.stale_ttl : stale_ttl
-      fresh_until = now + effective_ttl
-      stale_until = fresh_until + effective_stale_ttl
-      entry = PromptCache::CacheEntry.new(value, fresh_until, stale_until)
-
+      fresh_until = Time.now + effective_ttl
+      entry = PromptCache::CacheEntry.new(value, fresh_until, fresh_until + effective_stale_ttl)
       cache_set(key, entry, ttl: effective_ttl + effective_stale_ttl)
-
       value
     end
 

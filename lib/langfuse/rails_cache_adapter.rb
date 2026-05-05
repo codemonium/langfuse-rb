@@ -54,6 +54,7 @@ module Langfuse
 
       @ttl = ttl
       @namespace = namespace
+      @namespace_prefix = "#{namespace}:"
       @lock_timeout = lock_timeout
       @stale_ttl = stale_ttl
       @logger = logger
@@ -84,7 +85,8 @@ module Langfuse
     # @param value [Object] Value to cache
     # @return [Object] The cached value
     def set(key, value, ttl: nil, stale_ttl: nil)
-      # Calculate expiration: use total_ttl if SWR enabled, otherwise just ttl
+      # Total ttl when SWR is enabled, otherwise just ttl. Inlined (not pushed
+      # to a shared helper) to keep this hot write path allocation-free.
       effective_ttl = ttl.nil? ? self.ttl : ttl
       effective_stale_ttl = stale_ttl.nil? ? self.stale_ttl : stale_ttl
       expires_in = swr_enabled? ? effective_ttl + effective_stale_ttl : effective_ttl
@@ -155,13 +157,13 @@ module Langfuse
     # @return [Hash] Prompt cache statistics
     def stats
       {
-        backend: "rails",
+        backend: CacheBackend::RAILS,
         enabled: true,
         current_generation_entries: nil,
         orphaned_entries: nil,
         total_entries: nil,
         global_generation: generation_value(global_generation_key),
-        unsupported_counts: %i[current_generation_entries orphaned_entries total_entries]
+        unsupported_counts: CacheBackend::UNSUPPORTED_COUNT_KEYS
       }
     end
 
@@ -327,7 +329,7 @@ module Langfuse
     # @param key [String] Original cache key
     # @return [String] Namespaced cache key
     def namespaced_key(key)
-      key.start_with?("#{namespace}:") ? key : "#{namespace}:#{key}"
+      key.start_with?(@namespace_prefix) ? key : "#{@namespace_prefix}#{key}"
     end
 
     def global_generation_key

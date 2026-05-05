@@ -1030,6 +1030,96 @@ RSpec.describe Langfuse::ApiClient do
       expect(a_request(:get, prompt_url)).to have_been_made.once
     end
 
+    it "supports one-argument callable object cache observers" do
+      observer = Struct.new(:payloads) do
+        def call(payload)
+          payloads << payload
+        end
+      end.new([])
+      client = described_class.new(
+        public_key: public_key,
+        secret_key: secret_key,
+        base_url: base_url,
+        cache: cache,
+        cache_observer: observer
+      )
+      stub_prompt(prompt_response)
+
+      client.get_prompt_result(prompt_name)
+
+      expect(observer.payloads.map { |payload| payload.fetch(:event) }).to include(:miss, :write)
+      expect(observer.payloads.first).to include(logical_key: "greeting:production")
+    end
+
+    it "does not build cache event payloads when no listeners are active" do
+      client = described_class.new(
+        public_key: public_key,
+        secret_key: secret_key,
+        base_url: base_url,
+        cache: cache
+      )
+      built = false
+
+      client.emit_prompt_cache_event(:hit) do
+        built = true
+        {}
+      end
+
+      expect(built).to be(false)
+    end
+
+    it "emits event-only payloads when no explicit payload is provided" do
+      events = []
+      client = described_class.new(
+        public_key: public_key,
+        secret_key: secret_key,
+        base_url: base_url,
+        cache: cache,
+        cache_observer: ->(event, payload) { events << [event, payload] }
+      )
+
+      client.emit_prompt_cache_event(:manual)
+
+      expect(events).to eq([[:manual, { event: :manual }]])
+    end
+
+    it "skips ActiveSupport instrument when no subscriber exists for the notification name" do
+      client = described_class.new(
+        public_key: public_key,
+        secret_key: secret_key,
+        base_url: base_url,
+        cache: cache,
+        cache_observer: ->(_event, _payload) {} # listener present so emit isn't fully short-circuited
+      )
+      notifier = double(listening?: false)
+      notifications = Module.new
+      notifications.define_singleton_method(:notifier) { notifier }
+      notifications.define_singleton_method(:instrument) { |*_| raise "instrument should not be called" }
+      client.instance_variable_set(:@active_support_notifications, notifications)
+
+      expect { client.emit_prompt_cache_event(:hit, { foo: :bar }) }.not_to raise_error
+    end
+
+    it "instruments ActiveSupport when a subscriber listens for the notification name" do
+      received = []
+      client = described_class.new(
+        public_key: public_key,
+        secret_key: secret_key,
+        base_url: base_url,
+        cache: cache
+      )
+      notifier = double(listening?: true)
+      notifications = Module.new
+      notifications.define_singleton_method(:notifier) { notifier }
+      notifications.define_singleton_method(:instrument) { |name, payload| received << [name, payload] }
+      client.instance_variable_set(:@active_support_notifications, notifications)
+
+      client.emit_prompt_cache_event(:hit, { foo: :bar })
+
+      expect(received).to eq([[Langfuse::PromptCacheEvents::PROMPT_CACHE_NOTIFICATION,
+                               { foo: :bar, event: :hit }]])
+    end
+
     it "bypasses cache reads and writes when cache_ttl is zero" do
       stub_request(:get, prompt_url)
         .to_return(
